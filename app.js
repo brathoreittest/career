@@ -58,8 +58,12 @@ function detectLanguage(text) {
 
 function stripInlineTimestamps(text) {
   return text
+    .replace(/\b\d{1,2}:\d{2,3}\s*(?:seconds?|secs?|s)\b/gi, " ")
+    .replace(/\b\d{1,2}:\d{2}\s*(?:seconds?|secs?|s)\b/gi, " ")
+    .replace(/\b\d{1,2}:\d{2,3}(?!\d)\b/g, " ")
     .replace(/\b\d{1,2}:\d{2}:\d{2}(?:[.,]\d{1,3})?\b/g, " ")
     .replace(/\b\d{1,2}:\d{2}(?:[.,]\d{1,3})?\b/g, " ")
+    .replace(/\b(?:seconds?|secs?)\b/gi, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -128,7 +132,27 @@ async function fixBatchWithApi(lines, lang) {
 async function translateDialogue(text, sourceLang) {
   const endpoint = localStorage.getItem("subtitleTranslateEndpoint") || "";
   const targetLang = sourceLang === "hi" ? "en" : "hi";
-  if (!endpoint) return `[${targetLang.toUpperCase()}] ${text}`;
+
+  async function fallbackWebTranslate() {
+    const pair = `${sourceLang}|${targetLang}`;
+    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${encodeURIComponent(pair)}`;
+
+    try {
+      const response = await fetch(url, { method: "GET" });
+      if (!response.ok) throw new Error("mymemory failed");
+      const data = await response.json();
+      const translated = data?.responseData?.translatedText?.trim();
+      if (translated && translated.toLowerCase() !== text.trim().toLowerCase()) {
+        return translated;
+      }
+    } catch {
+      // ignore and return fallback below
+    }
+
+    return `[${targetLang.toUpperCase()}] ${text}`;
+  }
+
+  if (!endpoint) return fallbackWebTranslate();
 
   try {
     const response = await fetch(endpoint, {
@@ -138,9 +162,9 @@ async function translateDialogue(text, sourceLang) {
     });
     if (!response.ok) throw new Error("translation failed");
     const data = await response.json();
-    return data?.translation || `[${targetLang.toUpperCase()}] ${text}`;
+    return data?.translation || (await fallbackWebTranslate());
   } catch {
-    return `[${targetLang.toUpperCase()}] ${text}`;
+    return fallbackWebTranslate();
   }
 }
 
