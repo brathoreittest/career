@@ -55,6 +55,15 @@ function detectLanguage(text) {
   return /[\u0900-\u097F]/.test(text) ? "hi" : "en";
 }
 
+
+function stripInlineTimestamps(text) {
+  return text
+    .replace(/\b\d{1,2}:\d{2}:\d{2}(?:[.,]\d{1,3})?\b/g, " ")
+    .replace(/\b\d{1,2}:\d{2}(?:[.,]\d{1,3})?\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function parseSrt(raw) {
   const lines = raw.replace(/\r/g, "").split("\n");
   const out = [];
@@ -63,7 +72,8 @@ function parseSrt(raw) {
     if (!trimmed) continue;
     if (/^\d+$/.test(trimmed)) continue;
     if (/\d{2}:\d{2}:\d{2},\d{3}\s+-->\s+\d{2}:\d{2}:\d{2},\d{3}/.test(trimmed)) continue;
-    out.push(trimmed.replace(/<[^>]+>/g, "").trim());
+    const cleanText = stripInlineTimestamps(trimmed.replace(/<[^>]+>/g, "").trim());
+    if (cleanText) out.push(cleanText);
   }
   return out.filter(Boolean);
 }
