@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hindi/English Subtitle Practice</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="app-shell">
+    <section id="pinScreen" class="screen active">
+      <h1>Subtitle Practice</h1>
+      <p class="muted">Enter PIN to continue.</p>
+      <form id="pinForm" class="pin-form">
+        <input id="pinInput" type="password" inputmode="numeric" autocomplete="one-time-code" placeholder="PIN" maxlength="6" />
+        <button type="submit">Unlock</button>
+      </form>
+      <p id="pinError" class="error"></p>
+    </section>
+
+    <section id="appScreen" class="screen">
+      <header>
+        <label for="fileInput" class="upload-btn">Upload .srt</label>
+        <input id="fileInput" type="file" accept=".srt" hidden />
+        <p id="fileName" class="muted">No file selected.</p>
+      </header>
+
+      <section class="dialogue-area">
+        <div id="original" class="text original">Upload a subtitle file to begin.</div>
+        <div class="separator">↓</div>
+        <div id="translated" class="text translated">Translation will appear here.</div>
+      </section>
+
+      <footer>
+        <button id="playPauseBtn" class="play-pause">Play</button>
+      </footer>
+
+      <div id="activityPulse" class="hidden-pulse" aria-hidden="true"></div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
