@@ -1,405 +1,578 @@
 const PIN = "110096";
-const CACHE_KEY = "subtitlePracticeCacheV1";
-const MAX_FILES = 10;
-const MIN_BATCH = 10;
-const MAX_BATCH = 15;
+const STORAGE_KEY = "hindiEnglishPracticeStateV2";
+const WAKE_VISIBILITY_RETRY_MS = 250;
 
-const localCache = {
-  get() {
-    try {
-      return JSON.parse(localStorage.getItem(CACHE_KEY)) || { files: [], activeFileId: null };
-    } catch {
-      return { files: [], activeFileId: null };
-    }
-  },
-  set(value) {
-    localStorage.setItem(CACHE_KEY, JSON.stringify(value));
-  },
+const splitCueWords = ["अबे", "भाई", "अरे", "चलो", "सुनो", "देखो", "रुको"];
+const topicShiftPhrases = [
+  "मुझे समझ नहीं",
+  "समझ नहीं आ रहा",
+  "पता नहीं",
+  "लेकिन",
+  "पर",
+  "वैसे",
+  "और",
+  "फिर",
+];
+
+const dom = {
+  pinScreen: document.getElementById("pinScreen"),
+  appScreen: document.getElementById("appScreen"),
+  pinForm: document.getElementById("pinForm"),
+  pinInput: document.getElementById("pinInput"),
+  pinError: document.getElementById("pinError"),
+  fileInput: document.getElementById("fileInput"),
+  fileName: document.getElementById("fileName"),
+  original: document.getElementById("original"),
+  translated: document.getElementById("translated"),
+  playPauseBtn: document.getElementById("playPauseBtn"),
 };
 
 const state = {
   unlocked: false,
-  playing: false,
-  paused: true,
-  activeFileId: null,
-  data: localCache.get(),
-  voices: [],
+  dialogues: [], // [{ hindi, english }]
+  index: 0,
+  isPlaying: false,
+  timeoutId: null,
   wakeLock: null,
-  lastUtterance: null,
-  antiSleepTimer: null,
-  antiSleepTick: 0,
+  voices: [],
+  fileName: "",
 };
 
-const pinScreen = document.getElementById("pinScreen");
-const appScreen = document.getElementById("appScreen");
-const pinForm = document.getElementById("pinForm");
-const pinInput = document.getElementById("pinInput");
-const pinError = document.getElementById("pinError");
-const fileInput = document.getElementById("fileInput");
-const fileNameEl = document.getElementById("fileName");
-const originalEl = document.getElementById("original");
-const translatedEl = document.getElementById("translated");
-const playPauseBtn = document.getElementById("playPauseBtn");
-const activityPulse = document.getElementById("activityPulse");
-
-function saveState() {
-  state.data.activeFileId = state.activeFileId;
-  localCache.set(state.data);
+function loadStoredState() {
+  try {
+    const data = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
+    state.dialogues = Array.isArray(data.dialogues) ? data.dialogues : [];
+    state.index = Number.isInteger(data.index) ? data.index : 0;
+    state.fileName = typeof data.fileName === "string" ? data.fileName : "";
+    clampIndex();
+  } catch {
+    state.dialogues = [];
+    state.index = 0;
+    state.fileName = "";
+  }
 }
 
-function getActiveFile() {
-  return state.data.files.find((f) => f.id === state.activeFileId) || null;
+function persistState() {
+  localStorage.setItem(
+    STORAGE_KEY,
+    JSON.stringify({
+      dialogues: state.dialogues,
+      index: state.index,
+      fileName: state.fileName,
+    })
+  );
+}
+
+function clampIndex() {
+  if (state.index < 0) state.index = 0;
+  if (state.index >= state.dialogues.length && state.dialogues.length > 0) {
+    state.index = state.dialogues.length - 1;
+  }
 }
 
 function detectLanguage(text) {
   return /[\u0900-\u097F]/.test(text) ? "hi" : "en";
 }
 
+function parseTimeToSeconds(value) {
+  const m = value.match(/(\d{2}):(\d{2}):(\d{2})[,.](\d{3})/);
+  if (!m) return 0;
+  return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) + Number(m[4]) / 1000;
+}
 
-function stripInlineTimestamps(text) {
-  return text
-    .replace(/\b\d{1,2}:\d{2,3}\s*(?:seconds?|secs?|s)\b/gi, " ")
-    .replace(/\b\d{1,2}:\d{2}\s*(?:seconds?|secs?|s)\b/gi, " ")
-    .replace(/\b\d{1,2}:\d{2,3}(?!\d)\b/g, " ")
+function cleanSubtitleLine(line) {
+  const noTags = line.replace(/<[^>]+>/g, " ");
+  const noInlineTime = noTags
     .replace(/\b\d{1,2}:\d{2}:\d{2}(?:[.,]\d{1,3})?\b/g, " ")
-    .replace(/\b\d{1,2}:\d{2}(?:[.,]\d{1,3})?\b/g, " ")
-    .replace(/\b(?:seconds?|secs?)\b/gi, " ")
+    .replace(/\b\d{1,2}:\d{2,3}\s*(?:seconds?|secs?|s)\b/gi, " ")
+    .replace(/\b\d{1,2}:\d{2}(?:[.,]\d{1,3})?\b/g, " ");
+
+  const noSpeaker = noInlineTime.replace(/^\s*[A-Z][A-Z0-9 _-]{1,20}:\s*/g, "");
+
+  if (/^\s*\[[^\]]+\]\s*$/i.test(noSpeaker)) return "";
+  if (/^[♪\s]+$/.test(noSpeaker)) return "";
+  if (/\[(music|applause|laughter)\]/i.test(noSpeaker)) return "";
+
+  return noSpeaker.replace(/\s+/g, " ").trim();
+}
+
+function parseSrt(raw) {
+  const blocks = raw.replace(/\r/g, "").trim().split(/\n\s*\n/);
+  const parsed = [];
+
+  for (const block of blocks) {
+    const lines = block.split("\n").map((x) => x.trim()).filter(Boolean);
+    if (!lines.length) continue;
+
+    const timeLine = lines.find((line) => line.includes("-->"));
+    if (!timeLine) continue;
+
+    const [startRaw, endRaw] = timeLine.split("-->").map((x) => x.trim());
+    const start = parseTimeToSeconds(startRaw || "");
+    const end = parseTimeToSeconds(endRaw || "");
+
+    const dialogueLines = lines.filter(
+      (line) => !/^\d+$/.test(line) && !line.includes("-->")
+    );
+
+    const text = dialogueLines
+      .map(cleanSubtitleLine)
+      .filter(Boolean)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (!text) continue;
+    parsed.push({ start, end, text });
+  }
+
+  return parsed;
+}
+
+function mergeByTimingGap(blocks, maxGap = 1.5) {
+  if (!blocks.length) return [];
+  const merged = [blocks[0]];
+
+  for (let i = 1; i < blocks.length; i += 1) {
+    const current = blocks[i];
+    const prev = merged[merged.length - 1];
+    const gap = Math.max(0, current.start - prev.end);
+
+    if (gap < maxGap) {
+      prev.end = Math.max(prev.end, current.end);
+      prev.text = `${prev.text} ${current.text}`.replace(/\s+/g, " ").trim();
+    } else {
+      merged.push({ ...current });
+    }
+  }
+
+  return merged;
+}
+
+function removeRepeatedCaptions(lines) {
+  const out = [];
+  for (const text of lines) {
+    if (!text) continue;
+    if (!out.length) {
+      out.push(text);
+      continue;
+    }
+
+    const prev = out[out.length - 1];
+    if (text === prev) continue;
+
+    if (text.includes(prev)) {
+      out[out.length - 1] = text;
+      continue;
+    }
+
+    if (prev.includes(text)) {
+      continue;
+    }
+
+    out.push(text);
+  }
+  return out;
+}
+
+function splitOnCues(text) {
+  const parts = [text];
+  for (const cue of splitCueWords) {
+    for (let i = 0; i < parts.length; i += 1) {
+      const p = parts[i];
+      const re = new RegExp(`\\s+(?=${cue}\\b)`, "g");
+      const split = p.split(re).map((x) => x.trim()).filter(Boolean);
+      if (split.length > 1) {
+        parts.splice(i, 1, ...split);
+        i += split.length - 1;
+      }
+    }
+  }
+  return parts;
+}
+
+function splitOnTopicShift(text) {
+  for (const phrase of topicShiftPhrases) {
+    const idx = text.indexOf(phrase);
+    if (idx > 18) {
+      const a = text.slice(0, idx).trim();
+      const b = text.slice(idx).trim();
+      if (a && b) return [a, b];
+    }
+  }
+  return [text];
+}
+
+function splitToNaturalChunks(line) {
+  let chunks = line
+    .split(/(?<=[?!।.!])\s+/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  const commaExpanded = [];
+  for (const c of chunks) {
+    if (c.includes(",") && c.split(/\s+/).length > 8) {
+      commaExpanded.push(...c.split(",").map((x) => x.trim()).filter(Boolean));
+    } else {
+      commaExpanded.push(c);
+    }
+  }
+
+  const cueExpanded = commaExpanded.flatMap(splitOnCues);
+  chunks = cueExpanded.flatMap(splitOnTopicShift).map((x) => x.trim()).filter(Boolean);
+  return chunks;
+}
+
+function joinShortChunks(chunks, minWords = 7) {
+  const out = [];
+  let buffer = "";
+
+  function words(text) {
+    return text.trim().split(/\s+/).filter(Boolean).length;
+  }
+
+  for (const chunk of chunks) {
+    buffer = buffer ? `${buffer} ${chunk}` : chunk;
+    if (words(buffer) >= minWords) {
+      out.push(buffer.trim());
+      buffer = "";
+    }
+  }
+
+  if (buffer) {
+    if (out.length) {
+      out[out.length - 1] = `${out[out.length - 1]} ${buffer}`.replace(/\s+/g, " ").trim();
+    } else {
+      out.push(buffer.trim());
+    }
+  }
+
+  return out;
+}
+
+function colloquialEnglishPostprocess(text) {
+  return text
+    .replace(/\bBrother\b/gi, "Bro")
+    .replace(/\bbuddy\b/gi, "bro")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-function parseSrt(raw) {
-  const lines = raw.replace(/\r/g, "").split("\n");
-  const out = [];
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    if (/^\d+$/.test(trimmed)) continue;
-    if (/\d{2}:\d{2}:\d{2},\d{3}\s+-->\s+\d{2}:\d{2}:\d{2},\d{3}/.test(trimmed)) continue;
-    const cleanText = stripInlineTimestamps(trimmed.replace(/<[^>]+>/g, "").trim());
-    if (cleanText) out.push(cleanText);
-  }
-  return out.filter(Boolean);
-}
-
-function normalizeChunkWithoutWordChanges(lines) {
-  const merged = [];
-  for (const line of lines) {
-    if (!line) continue;
-    if (!merged.length) {
-      merged.push(line);
-      continue;
-    }
-
-    const previous = merged[merged.length - 1];
-    const prevEnds = /[.!?।…]$/.test(previous);
-    const startsLower = /^[a-z]/.test(line);
-    const startsContinuation = /^[,;:)]/.test(line);
-    if (!prevEnds || startsLower || startsContinuation) {
-      merged[merged.length - 1] = `${previous} ${line}`.replace(/\s+/g, " ").trim();
-    } else {
-      merged.push(line);
-    }
-  }
-
-  const split = [];
-  for (const item of merged) {
-    const parts = item.split(/(?<=[.!?।])\s+/).map((x) => x.trim()).filter(Boolean);
-    split.push(...parts);
-  }
-  return split;
-}
-
-async function fixBatchWithApi(lines, lang) {
-  const endpoint = localStorage.getItem("subtitleFixEndpoint") || "";
-  if (!endpoint) return normalizeChunkWithoutWordChanges(lines);
-
-  try {
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ lines, language: lang, policy: "merge_or_split_only_no_word_change" }),
-    });
-    if (!response.ok) throw new Error("batch fix failed");
-    const data = await response.json();
-    if (Array.isArray(data?.lines) && data.lines.length) return data.lines;
-  } catch {
-    // fallback intentionally silent
-  }
-  return normalizeChunkWithoutWordChanges(lines);
-}
-
-async function translateDialogue(text, sourceLang) {
+async function translateText(text, sourceLang, targetLang) {
   const endpoint = localStorage.getItem("subtitleTranslateEndpoint") || "";
-  const targetLang = sourceLang === "hi" ? "en" : "hi";
 
-  async function fallbackWebTranslate() {
-    const pair = `${sourceLang}|${targetLang}`;
-    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${encodeURIComponent(pair)}`;
-
+  if (endpoint) {
     try {
-      const response = await fetch(url, { method: "GET" });
-      if (!response.ok) throw new Error("mymemory failed");
-      const data = await response.json();
-      const translated = data?.responseData?.translatedText?.trim();
-      if (translated && translated.toLowerCase() !== text.trim().toLowerCase()) {
-        return translated;
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, sourceLang, targetLang, style: "natural_spoken" }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (typeof data?.translation === "string" && data.translation.trim()) {
+          return colloquialEnglishPostprocess(data.translation);
+        }
       }
     } catch {
-      // ignore and return fallback below
+      // continue to fallback
     }
-
-    return `[${targetLang.toUpperCase()}] ${text}`;
   }
 
-  if (!endpoint) return fallbackWebTranslate();
-
   try {
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, sourceLang, targetLang }),
-    });
-    if (!response.ok) throw new Error("translation failed");
-    const data = await response.json();
-    return data?.translation || (await fallbackWebTranslate());
+    const pair = `${sourceLang}|${targetLang}`;
+    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${encodeURIComponent(pair)}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("web fallback failed");
+    const data = await res.json();
+    const translated = data?.responseData?.translatedText?.trim();
+    if (translated) return colloquialEnglishPostprocess(translated);
   } catch {
-    return fallbackWebTranslate();
+    // final fallback
+  }
+
+  return `[${targetLang.toUpperCase()}] ${text}`;
+}
+
+async function buildDialoguesFromSrtText(raw) {
+  const blocks = parseSrt(raw);
+  const mergedByGap = mergeByTimingGap(blocks, 1.5);
+  const deduped = removeRepeatedCaptions(mergedByGap.map((x) => x.text));
+
+  const rawChunks = deduped.flatMap(splitToNaturalChunks);
+  const finalChunks = joinShortChunks(rawChunks, 7);
+
+  const dialogues = [];
+  for (const chunk of finalChunks) {
+    const lang = detectLanguage(chunk);
+    if (lang === "hi") {
+      const english = await translateText(chunk, "hi", "en");
+      dialogues.push({ hindi: chunk, english });
+    } else {
+      const hindi = await translateText(chunk, "en", "hi");
+      dialogues.push({ hindi, english: chunk });
+    }
+  }
+
+  return dialogues;
+}
+
+function dynamicDelaySeconds(text) {
+  const words = text.trim().split(/\s+/).filter(Boolean).length;
+  return words * 0.8 + 2;
+}
+
+function setPlayButtonLabel() {
+  dom.playPauseBtn.textContent = state.isPlaying ? "Pause" : "Play";
+}
+
+function setEnglishVisible(text, visible) {
+  dom.translated.textContent = text || "";
+  if (visible) {
+    dom.translated.classList.add("show");
+  } else {
+    dom.translated.classList.remove("show");
   }
 }
 
-function chooseVoiceForLanguage(lang) {
-  const list = state.voices;
-  const hints = lang === "hi" ? ["hi-IN", "hi", "hindi"] : ["en-IN", "en-US", "en-GB", "en", "english"];
+function chooseVoice(langCode) {
+  const candidates = state.voices;
+  const hints = langCode === "hi-IN" ? ["hi-IN", "hi"] : ["en-US", "en-IN", "en-GB", "en"];
   for (const hint of hints) {
-    const match = list.find((v) => (v.lang || "").toLowerCase().includes(hint.toLowerCase()) || (v.name || "").toLowerCase().includes(hint.toLowerCase()));
-    if (match) return match;
+    const found = candidates.find((v) => (v.lang || "").toLowerCase().includes(hint.toLowerCase()));
+    if (found) return found;
   }
-  return list[0] || null;
+  return null;
 }
 
 function speak(text, lang) {
   return new Promise((resolve) => {
-    if (!text || !window.speechSynthesis) {
+    if (!window.speechSynthesis || !text) {
       resolve();
       return;
     }
 
-    window.speechSynthesis.cancel();
+    speechSynthesis.cancel();
     const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = lang === "hi" ? "hi-IN" : "en-US";
-    const voice = chooseVoiceForLanguage(lang);
+    utterance.lang = lang;
+    utterance.rate = 0.9;
+    const voice = chooseVoice(lang);
     if (voice) utterance.voice = voice;
     utterance.onend = () => resolve();
     utterance.onerror = () => resolve();
-    state.lastUtterance = utterance;
-    window.speechSynthesis.speak(utterance);
+    speechSynthesis.speak(utterance);
   });
 }
 
-function wait(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function sentenceDelaySeconds(text) {
-  const wordCount = text.trim().split(/\s+/).filter(Boolean).length || 1;
-  return (wordCount * 0.9) + 2;
-}
-
-function renderPair(pair, showTranslation = true) {
-  originalEl.textContent = pair?.original || "No dialogue.";
-  translatedEl.textContent = showTranslation ? (pair?.translated || "") : "...";
-}
-
-function setPlayButton() {
-  playPauseBtn.textContent = state.paused ? "Play" : "Pause";
-}
-
-async function requestWakeLock() {
-  if ("wakeLock" in navigator) {
-    try {
-      state.wakeLock = await navigator.wakeLock.request("screen");
-      state.wakeLock.addEventListener("release", () => {
-        state.wakeLock = null;
-      });
-    } catch {
-      // fallback will run
-    }
-  }
-
-  if (!state.antiSleepTimer) {
-    state.antiSleepTimer = setInterval(() => {
-      state.antiSleepTick += 1;
-      activityPulse.style.transform = `translateX(${state.antiSleepTick % 2}px)`;
-    }, 15000);
+function clearFlowTimer() {
+  if (state.timeoutId) {
+    clearTimeout(state.timeoutId);
+    state.timeoutId = null;
   }
 }
 
-async function processBatch(fileEntry) {
-  if (fileEntry.pending.length === 0) return;
+function sleep(ms) {
+  return new Promise((resolve) => {
+    state.timeoutId = setTimeout(() => {
+      state.timeoutId = null;
+      resolve();
+    }, ms);
+  });
+}
 
-  const size = Math.min(MAX_BATCH, Math.max(MIN_BATCH, 12));
-  const chunk = fileEntry.pending.slice(0, size);
-  const fileLang = detectLanguage(chunk.join(" "));
-  const fixed = await fixBatchWithApi(chunk, fileLang);
-
-  for (const line of fixed) {
-    const sourceLang = detectLanguage(line);
-    const translated = await translateDialogue(line, sourceLang);
-    fileEntry.processed.push({
-      original: line,
-      translated,
-      sourceLang,
-      targetLang: sourceLang === "hi" ? "en" : "hi",
+async function acquireWakeLock() {
+  if (!("wakeLock" in navigator)) return;
+  try {
+    state.wakeLock = await navigator.wakeLock.request("screen");
+    state.wakeLock.addEventListener("release", () => {
+      state.wakeLock = null;
     });
-  }
-
-  fileEntry.pending = fileEntry.pending.slice(chunk.length);
-  saveState();
-}
-
-async function ensureProcessedAhead(fileEntry) {
-  const remaining = fileEntry.processed.length - fileEntry.progress;
-  if (remaining < 2 && fileEntry.pending.length > 0) {
-    await processBatch(fileEntry);
+  } catch {
+    // ignore
   }
 }
 
-async function playbackLoop() {
-  if (state.playing) return;
-  state.playing = true;
-  await requestWakeLock();
-
-  while (!state.paused) {
-    const fileEntry = getActiveFile();
-    if (!fileEntry) break;
-
-    await ensureProcessedAhead(fileEntry);
-    const current = fileEntry.processed[fileEntry.progress];
-
-    if (!current) {
-      originalEl.textContent = "Reached end of dialogues.";
-      translatedEl.textContent = "Upload another file to continue practicing.";
-      state.paused = true;
-      setPlayButton();
-      break;
+async function releaseWakeLock() {
+  if (state.wakeLock) {
+    try {
+      await state.wakeLock.release();
+    } catch {
+      // ignore
     }
-
-    renderPair(current, false);
-    await speak(current.original, current.sourceLang);
-    await wait(sentenceDelaySeconds(current.original) * 1000);
-    if (state.paused) break;
-
-    renderPair(current, true);
-    await speak(current.translated, current.targetLang);
-    await wait(sentenceDelaySeconds(current.translated) * 1000);
-
-    if (state.paused) break;
-    fileEntry.progress += 1;
-    saveState();
+    state.wakeLock = null;
   }
-
-  state.playing = false;
 }
 
-async function loadSrtFile(file) {
-  const raw = await file.text();
-  const lines = parseSrt(raw);
-
-  const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  const entry = {
-    id,
-    fileName: file.name,
-    processed: [],
-    pending: lines,
-    progress: 0,
-    updatedAt: Date.now(),
-  };
-
-  state.data.files = [entry, ...state.data.files.filter((f) => f.fileName !== file.name)].slice(0, MAX_FILES);
-  state.activeFileId = id;
-  saveState();
-
-  fileNameEl.textContent = `${file.name} (${lines.length} dialogues detected)`;
-  originalEl.textContent = "Processing first batch...";
-  translatedEl.textContent = "";
-  await processBatch(entry);
-
-  state.paused = false;
-  setPlayButton();
-  playbackLoop();
-}
-
-function resumeLastSession() {
-  const activeId = state.data.activeFileId;
-  const fallback = state.data.files[0]?.id || null;
-  state.activeFileId = activeId || fallback;
-
-  const fileEntry = getActiveFile();
-  if (!fileEntry) {
-    fileNameEl.textContent = "No cached file. Upload a subtitle file.";
+function renderCurrentDialogue(showEnglish = false) {
+  const current = state.dialogues[state.index];
+  if (!current) {
+    dom.original.textContent = "Upload an .srt file to start practice.";
+    setEnglishVisible("", false);
     return;
   }
 
-  fileNameEl.textContent = `${fileEntry.fileName} (resuming)`;
-  const current = fileEntry.processed[fileEntry.progress] || fileEntry.processed[fileEntry.progress - 1];
-  if (current) renderPair(current, true);
-
-  state.paused = false;
-  setPlayButton();
-  playbackLoop();
+  dom.original.textContent = current.hindi;
+  setEnglishVisible(showEnglish ? current.english : "", showEnglish);
 }
 
-function unlock() {
+function stopPractice() {
+  state.isPlaying = false;
+  setPlayButtonLabel();
+  clearFlowTimer();
+  speechSynthesis.cancel();
+  releaseWakeLock();
+}
+
+async function showDialogue() {
+  if (!state.isPlaying) return;
+
+  const current = state.dialogues[state.index];
+  if (!current) {
+    stopPractice();
+    dom.original.textContent = "Practice complete. Upload another file to continue.";
+    setEnglishVisible("", false);
+    return;
+  }
+
+  renderCurrentDialogue(false);
+  await speak(current.hindi, "hi-IN");
+  if (!state.isPlaying) return;
+
+  await sleep(dynamicDelaySeconds(current.hindi) * 1000);
+  if (!state.isPlaying) return;
+
+  setEnglishVisible(current.english, true);
+  await speak(current.english, "en-US");
+  if (!state.isPlaying) return;
+
+  await sleep(4000);
+  if (!state.isPlaying) return;
+
+  state.index += 1;
+  if (state.index >= state.dialogues.length) {
+    state.index = state.dialogues.length;
+  }
+  persistState();
+
+  if (state.index >= state.dialogues.length) {
+    stopPractice();
+    dom.original.textContent = "Practice complete. Upload another file to continue.";
+    return;
+  }
+
+  showDialogue();
+}
+
+async function startPractice() {
+  if (!state.dialogues.length) return;
+  if (state.index >= state.dialogues.length) state.index = 0;
+  state.isPlaying = true;
+  setPlayButtonLabel();
+  await acquireWakeLock();
+  showDialogue();
+}
+
+function resumePreview() {
+  if (!state.dialogues.length) {
+    dom.fileName.textContent = "No file selected.";
+    renderCurrentDialogue(false);
+    setPlayButtonLabel();
+    return;
+  }
+
+  clampIndex();
+  dom.fileName.textContent = `${state.fileName || "Cached subtitles"} • ${state.dialogues.length} dialogues • Resume at ${state.index + 1}`;
+  renderCurrentDialogue(true);
+  setPlayButtonLabel();
+}
+
+function handleNewFile(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(new Error("Failed to read file."));
+    reader.readAsText(file, "utf-8");
+  });
+}
+
+async function onUpload(file) {
+  stopPractice();
+  dom.original.textContent = "Processing subtitles...";
+  setEnglishVisible("", false);
+
+  try {
+    const raw = await handleNewFile(file);
+    const dialogues = await buildDialoguesFromSrtText(raw);
+
+    state.dialogues = dialogues;
+    state.index = 0;
+    state.fileName = file.name;
+    persistState();
+
+    dom.fileName.textContent = `${file.name} • ${dialogues.length} dialogues`;
+
+    if (!dialogues.length) {
+      dom.original.textContent = "No usable dialogues found in this .srt file.";
+      return;
+    }
+
+    renderCurrentDialogue(false);
+    await startPractice();
+  } catch {
+    dom.original.textContent = "Could not parse subtitle file.";
+  }
+}
+
+function unlockApp() {
   state.unlocked = true;
-  pinScreen.classList.remove("active");
-  appScreen.classList.add("active");
-  resumeLastSession();
+  dom.pinScreen.classList.remove("active");
+  dom.appScreen.classList.add("active");
+  resumePreview();
 }
-
-pinForm.addEventListener("submit", (event) => {
-  event.preventDefault();
-  if (pinInput.value === PIN) {
-    pinError.textContent = "";
-    unlock();
-  } else {
-    pinError.textContent = "Invalid PIN.";
-  }
-});
-
-fileInput.addEventListener("change", async (event) => {
-  const [file] = event.target.files || [];
-  if (!file) return;
-
-  window.speechSynthesis?.cancel();
-  state.paused = true;
-  state.playing = false;
-  setPlayButton();
-  await loadSrtFile(file);
-  event.target.value = "";
-});
-
-playPauseBtn.addEventListener("click", () => {
-  state.paused = !state.paused;
-  setPlayButton();
-  if (!state.paused) playbackLoop();
-  else window.speechSynthesis?.cancel();
-});
-
-window.addEventListener("beforeunload", saveState);
-document.addEventListener("visibilitychange", async () => {
-  if (document.visibilityState === "visible" && !state.paused && !state.wakeLock) {
-    await requestWakeLock();
-  }
-});
 
 function initVoices() {
   state.voices = speechSynthesis.getVoices();
 }
+
+dom.pinForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (dom.pinInput.value === PIN) {
+    dom.pinError.textContent = "";
+    unlockApp();
+  } else {
+    dom.pinError.textContent = "Invalid PIN.";
+  }
+});
+
+dom.fileInput.addEventListener("change", async (event) => {
+  const [file] = event.target.files || [];
+  if (!file) return;
+  await onUpload(file);
+  event.target.value = "";
+});
+
+dom.playPauseBtn.addEventListener("click", async () => {
+  if (state.isPlaying) {
+    stopPractice();
+    return;
+  }
+  await startPractice();
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && state.isPlaying) {
+    setTimeout(() => {
+      if (state.isPlaying && !state.wakeLock) acquireWakeLock();
+    }, WAKE_VISIBILITY_RETRY_MS);
+  }
+});
+
+window.addEventListener("beforeunload", persistState);
 
 if ("speechSynthesis" in window) {
   initVoices();
   speechSynthesis.onvoiceschanged = initVoices;
 }
 
-setPlayButton();
+loadStoredState();
+setPlayButtonLabel();
